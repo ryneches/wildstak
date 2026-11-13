@@ -1,0 +1,16 @@
+# Your settings and secrets (copy the *.example files)
+.env
+*.key
+local.mk
+dashboards/config.toml
+firmware/device.yaml
+firmware/secrets.yaml
+
+# Build output
+firmware/.esphome/
+__pycache__/
+.venv/
+docs/media/
+docs/data/
+docs/dashboards.md
+site/

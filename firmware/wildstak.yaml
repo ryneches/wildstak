@@ -1,0 +1,876 @@
+# WildStak firmware for the reTerminal E1001, v0.3.
+#
+# This is the shared base: don't edit it for your own setup. Copy
+# device.example.yaml to device.yaml, which includes this file as a package
+# and overrides the substitutions below (and anything else, e.g. a static IP
+# or MQTT over TLS). Build with `esphome run device.yaml`.
+#
+# Design: NOTES.md, "Firmware redesign (v0.3)". Control logic is in wake.h;
+# this file wires up the hardware and the network steps.
+#
+# Two modes:
+#   Carousel: each wake shows the card the clock calls for, syncs if due, and
+#     deep sleeps until the next deadline. White buttons: next / previous.
+#   Service: green button, or any power-on / reflash. Wi-Fi up, sync now, a
+#     status screen with a countdown bar, reachable on the network (OTA, logs)
+#     until the countdown ends. Green again: more time. White: back to cards.
+# USB serial always works for recovery.
+#
+# Home Assistant link: MQTT, through HA's MQTT integration and discovery.
+# Settings are the device's own controls (number/select/switch below, on its
+# HA device page); command_retain makes HA publish each change as a retained
+# message, so the latest value of every setting waits at the broker until
+# the next sync picks it up. Readings are published as retained sensor
+# states. The device starts every connection; nothing waits for HA.
+
+substitutions:
+  name: wildstak
+  friendly_name: WildStak
+  firmware_version: "0.3.3"
+
+  # ---- Settings: defaults until Home Assistant's settings message arrives
+  # (the HA controls under number:/select:/switch:, see wake.h) ----
+  rotate_s: "60"             # seconds per card
+  sync_period_min: "60"      # must divide 60
+  sync_offset_min: "5"       # sync this many minutes past each period boundary
+  max_sleep_min: "60"        # longest single sleep
+  service_s: "120"           # service mode countdown
+  full_refresh_every: "60"   # refreshes between de-ghosting full refreshes; 0 = never
+  deep_sleep_enabled: "true" # false: stay awake with Wi-Fi up (bench / USB power)
+
+  # ---- Site: set all of these in device.yaml ----
+  # Where `make` publishes the card manifest (see Makefile); manifest_host is
+  # the manifest URL's hostname, for the DNS cache.
+  manifest_host: "dashboards.example.com"
+  manifest_url: "https://dashboards.example.com/data/dashboards.txt"
+  # The MQTT broker Home Assistant uses (e.g. the Mosquitto add-on). Plain
+  # MQTT by default; for TLS, see device.example.yaml.
+  mqtt_broker: "homeassistant.local"
+  mqtt_port: "1883"
+  mqtt_username: "wildstak"
+  timezone: "UTC"            # IANA name, e.g. Europe/Berlin
+  ntp_server: "pool.ntp.org"
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  project:
+    name: "ryneches.wildstak"
+    version: "${firmware_version}"
+  includes:
+    - card_cache.h
+    - dns_cache.h
+    - wake.h
+  on_boot:
+    # After every component's setup (display, I2C, Wi-Fi component).
+    priority: -100
+    then:
+      - pcf8563.read_time: rtc_time
+      - lambda: |-
+          auto &s = wake::settings;
+          s.rotate_s = ${rotate_s};
+          s.sync_period_s = ${sync_period_min} * 60;
+          s.sync_offset_s = ${sync_offset_min} * 60;
+          s.max_sleep_s = ${max_sleep_min} * 60;
+          s.service_s = ${service_s};
+          s.full_refresh_every = ${full_refresh_every};
+          s.deep_sleep = ${deep_sleep_enabled};
+          wake::on_boot();  // replaces the defaults with HA's settings, if any
+          id(epaper_display)->set_full_update_every(s.full_refresh_every);
+          // Current values for the HA controls (sent when MQTT connects).
+          id(set_rotate).publish_state(s.rotate_s);
+          id(set_sync_period).publish_state(std::to_string(s.sync_period_s / 60));
+          id(set_sync_offset).publish_state(s.sync_offset_s / 60);
+          id(set_service).publish_state(s.service_s);
+          id(set_full_refresh).publish_state(s.full_refresh_every);
+      # Started here rather than by the tick so a rotation wake doesn't wait
+      # up to a second for the first tick.
+      - script.execute: wake_cycle
+
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [ waveshare_epaper ]
+
+esp32:
+  board: esp32-s3-devkitc-1
+  # Winbond W25Q256 (32 MB, quad). Declared 16 MB: partitions_cards.csv fits,
+  # and >16 MB would need 32-bit flash addressing. The image header still says
+  # DIO; the bootloader switches to QIO itself.
+  flash_size: 16MB
+  flash_mode: qio
+  partitions: partitions_cards.csv
+  framework:
+    type: esp-idf  # needed for verify_ssl in http_request
+    sdkconfig_options:
+      # All measured on a deep-sleep wake; see NOTES.md.
+      CONFIG_SPIRAM_MEMTEST: n                       # ~430 ms per wake
+      # Bootloader options: take effect only after a USB serial flash.
+      CONFIG_BOOTLOADER_LOG_LEVEL_NONE: y
+      CONFIG_BOOTLOADER_SKIP_VALIDATE_IN_DEEP_SLEEP: y
+      # dns_cache.h implements lwIP's external-resolve hook.
+      CONFIG_LWIP_HOOK_NETCONN_EXT_RESOLVE_CUSTOM: y
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+logger:
+  hardware_uart: UART0
+
+# The Home Assistant link. The device only connects during syncs and service
+# mode, so: no birth/will/shutdown messages (entities would flip to
+# "unavailable" at every sleep), retained states (the last reading stays in
+# HA), and no reboot on a missing connection.
+mqtt:
+  id: mqtt_client
+  broker: ${mqtt_broker}
+  port: ${mqtt_port}
+  username: ${mqtt_username}
+  password: !secret mqtt_password
+  discovery: true
+  # Enabled by sync_cards once Wi-Fi is up, disabled before the radio goes
+  # off. Enabled at boot it would resolve the broker with Wi-Fi still off,
+  # fail, and then wait out a 20 s DNS timeout plus a 5 s retry delay
+  # (mqtt_client.cpp), longer than a whole sync.
+  enable_on_boot: false
+  birth_message:
+  will_message:
+  shutdown_message:
+  reboot_timeout: 0s
+  # Logs over MQTT (INFO and up) while connected, e.g. in service mode:
+  # `esphome logs device.yaml` reads them without the native API.
+  log_topic:
+    topic: ${name}/debug
+    level: INFO
+
+# ---- Settings, as the device's own controls in Home Assistant ----
+# command_retain: HA publishes changes as retained messages, so each
+# setting's latest value waits at the broker until the device next syncs.
+# Every set_action validates (wake.h), applies, persists, and reports the
+# applied value back, so HA shows what the device actually uses; until the
+# next sync (green button: now), a change shows the old value.
+number:
+  - platform: template
+    id: set_rotate
+    name: "Rotate interval"
+    icon: mdi:image-multiple-outline
+    entity_category: config
+    unit_of_measurement: s
+    mode: box
+    min_value: 10
+    max_value: 3600
+    step: 5
+    command_retain: true
+    set_action:
+      - lambda: |-
+          wake::set_rotate_s(x);
+          id(set_rotate).publish_state(wake::settings.rotate_s);
+  - platform: template
+    id: set_sync_offset
+    name: "Sync offset"
+    icon: mdi:timer-plus-outline
+    entity_category: config
+    unit_of_measurement: min
+    mode: box
+    min_value: 0
+    max_value: 59
+    step: 1
+    command_retain: true
+    set_action:
+      - lambda: |-
+          wake::set_sync_offset_min(x);
+          id(set_sync_offset).publish_state(wake::settings.sync_offset_s / 60);
+  - platform: template
+    id: set_service
+    name: "Service mode time"
+    icon: mdi:wrench-clock
+    entity_category: config
+    unit_of_measurement: s
+    mode: box
+    min_value: 30
+    max_value: 3600
+    step: 10
+    command_retain: true
+    set_action:
+      - lambda: |-
+          wake::set_service_s(x);
+          id(set_service).publish_state(wake::settings.service_s);
+  - platform: template
+    id: set_full_refresh
+    name: "Full refresh every"
+    icon: mdi:refresh
+    entity_category: config
+    unit_of_measurement: refreshes
+    mode: box
+    min_value: 0
+    max_value: 1000
+    step: 1
+    command_retain: true
+    set_action:
+      - lambda: |-
+          wake::set_full_refresh_every(x);
+          id(epaper_display)->set_full_update_every(wake::settings.full_refresh_every);
+          id(set_full_refresh).publish_state(wake::settings.full_refresh_every);
+
+select:
+  - platform: template
+    id: set_sync_period
+    name: "Sync period"
+    icon: mdi:cloud-sync-outline
+    entity_category: config
+    # Minutes; each divides 60, so syncs land on a fixed hourly grid
+    # (e.g. 15 with offset 5: :05, :20, :35, :50).
+    options: ["5", "6", "10", "12", "15", "20", "30", "60"]
+    command_retain: true
+    set_action:
+      - lambda: |-
+          wake::set_sync_period_min(atoi(x.c_str()));
+          id(set_sync_period).publish_state(std::to_string(wake::settings.sync_period_s / 60));
+          id(set_sync_offset).publish_state(wake::settings.sync_offset_s / 60);
+
+switch:
+  - platform: template
+    id: set_deep_sleep
+    name: "Deep sleep"
+    icon: mdi:power-sleep
+    entity_category: config
+    command_retain: true
+    # Report the setting, never set it at boot: any restore mode other than
+    # DISABLED "restores" a state on startup by running turn_on/off_action.
+    restore_mode: DISABLED
+    lambda: 'return wake::settings.deep_sleep;'
+    turn_on_action:
+      - lambda: 'wake::set_deep_sleep(true);'
+    turn_off_action:
+      - lambda: 'wake::set_deep_sleep(false);'
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+    on_begin:
+      - lambda: 'wake::boot.ota_in_progress = true;'
+    on_error:
+      - lambda: 'wake::boot.ota_in_progress = false;'
+
+wifi:
+  id: wifi_id
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  enable_on_boot: false  # only syncs and service mode use the radio
+  reboot_timeout: 0s
+  fast_connect: true     # remembered BSSID/channel: no scan (~2.9 s saved)
+  # DHCP by default. A static IP outside the router's DHCP range saves ~1.7 s
+  # per sync: see device.example.yaml.
+
+http_request:
+  verify_ssl: true
+  timeout: 15s
+  watchdog_timeout: 20s
+
+spi:
+  clk_pin: GPIO7
+  mosi_pin: GPIO9
+
+i2c:
+  scl: GPIO20
+  sda: GPIO19
+
+font:
+  - file: "../dashboards/fonts/x12y16pxMaruMonica.ttf"
+    id: font_pixel
+    size: 16
+    bpp: 1
+  - file: "../dashboards/fonts/x12y16pxMaruMonica.ttf"
+    id: font_pixel_lg
+    size: 32
+    bpp: 1
+
+# Decodes one downloaded card at a time during a sync; wake.h stores the
+# rendered result in the flash cache. BINARY, not GRAYSCALE: see NOTES.md.
+image:
+  - platform: online_image
+    id: card_image
+    format: PNG
+    type: BINARY
+    buffer_size: 65536
+    url: "https://${manifest_host}/media/placeholder.png"  # always overwritten
+    update_interval: never
+    on_download_finished:
+      - lambda: |-
+          id(dl_ok) = true;
+          id(dl_done) = true;
+    on_error:
+      - lambda: |-
+          dns_cache::invalidate();
+          id(dl_ok) = false;
+          id(dl_done) = true;
+
+time:
+  # Keeps time through deep sleep; read on every boot.
+  - platform: pcf8563
+    id: rtc_time
+    address: 0x51
+    update_interval: never
+    timezone: ${timezone}
+  # Sets the clock whenever the radio is up; a sync waits for it only when the
+  # clock is invalid or more than a day old.
+  - platform: sntp
+    id: sntp_time
+    timezone: ${timezone}
+    servers:
+      - ${ntp_server}
+    on_time_sync:
+      then:
+        - pcf8563.write_time: rtc_time
+        - lambda: |-
+            wake::state.last_ntp = wake::now();
+            id(ntp_synced) = true;
+
+output:
+  - platform: gpio
+    pin: GPIO21  # battery measurement divider; only on while measuring
+    id: bsp_battery_enable
+
+# Readings for Home Assistant. Measured and published on sync wakes only;
+# expire_after marks them stale in HA if syncs stop (3 missed hourly syncs).
+sensor:
+  - platform: adc
+    pin: GPIO1
+    id: battery_voltage
+    name: "Battery voltage"
+    expire_after: 3h
+    update_interval: never
+    attenuation: 12db
+    filters:
+      - multiply: 2.0
+  - platform: template
+    id: battery_level
+    name: "Battery"
+    unit_of_measurement: "%"
+    device_class: battery
+    state_class: measurement
+    expire_after: 3h
+    update_interval: never
+    lambda: 'return id(battery_voltage).state;'
+    filters:
+      - calibrate_linear:
+          - 4.15 -> 100.0
+          - 3.96 -> 90.0
+          - 3.91 -> 80.0
+          - 3.85 -> 70.0
+          - 3.80 -> 60.0
+          - 3.75 -> 50.0
+          - 3.68 -> 40.0
+          - 3.58 -> 30.0
+          - 3.49 -> 20.0
+          - 3.41 -> 10.0
+          - 3.30 -> 5.0
+          - 3.27 -> 0.0
+      - clamp:
+          min_value: 0
+          max_value: 100
+  - platform: sht4x
+    update_interval: never
+    id: sht
+    temperature:
+      id: temp_sensor
+      name: "Temperature"
+      expire_after: 3h
+    humidity:
+      id: hum_sensor
+      name: "Humidity"
+      expire_after: 3h
+  - platform: template
+    id: wifi_rssi
+    name: "Wi-Fi signal"
+    accuracy_decimals: 0
+    unit_of_measurement: "dBm"
+    device_class: signal_strength
+    entity_category: diagnostic
+    expire_after: 3h
+    update_interval: never
+  - platform: template
+    id: sync_duration
+    name: "Sync duration"
+    accuracy_decimals: 0
+    unit_of_measurement: "ms"
+    entity_category: diagnostic
+    update_interval: never
+  - platform: template
+    id: wake_active
+    name: "Last wake active time"
+    accuracy_decimals: 0
+    unit_of_measurement: "ms"
+    entity_category: diagnostic
+    update_interval: never
+  - platform: template
+    id: wake_count
+    name: "Wakes"
+    icon: mdi:alarm
+    accuracy_decimals: 0
+    # Counts every wake since the last power loss or reflash (it lives in RTC
+    # memory); total_increasing makes HA treat that reset as a counter reset.
+    state_class: total_increasing
+    entity_category: diagnostic
+    update_interval: never
+  - platform: template
+    id: card_count
+    name: "Cards"
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    update_interval: never
+
+text_sensor:
+  - platform: template
+    id: sync_result
+    name: "Last sync"
+    entity_category: diagnostic
+    update_interval: never
+  - platform: template
+    id: last_sync_time
+    name: "Last sync time"
+    device_class: timestamp
+    entity_category: diagnostic
+    update_interval: never
+  - platform: template
+    id: firmware
+    name: "Firmware"
+    entity_category: diagnostic
+    update_interval: never
+
+# Buttons. The same pins wake the device (deep_sleep esp32_ext1_wakeup); a
+# button wake is decoded in wake::on_boot(), and presses while awake arrive
+# here.
+binary_sensor:
+  - platform: gpio  # green: service mode (in service mode: more time)
+    id: key_green
+    pin:
+      number: GPIO3
+      mode: INPUT_PULLUP
+      inverted: true
+      allow_other_uses: true
+      ignore_strapping_warning: true
+    on_press:
+      - lambda: 'wake::on_button(wake::BUTTON_GREEN);'
+  - platform: gpio  # right white: next card (in service mode: back to cards)
+    id: key_next
+    pin:
+      number: GPIO4
+      mode: INPUT_PULLUP
+      inverted: true
+      allow_other_uses: true
+    on_press:
+      - lambda: 'wake::on_button(wake::BUTTON_NEXT);'
+  - platform: gpio  # left white: previous card (in service mode: back to cards)
+    id: key_prev
+    pin:
+      number: GPIO5
+      mode: INPUT_PULLUP
+      inverted: true
+      allow_other_uses: true
+    on_press:
+      - lambda: 'wake::on_button(wake::BUTTON_PREV);'
+
+deep_sleep:
+  id: deep_sleep_1
+  # No run_duration: wake::try_sleep() decides when to sleep, and for how long.
+  esp32_ext1_wakeup:
+    mode: ANY_LOW
+    pins:
+      - number: GPIO3
+        mode: INPUT_PULLUP
+        allow_other_uses: true
+        ignore_strapping_warning: true
+      - number: GPIO4
+        mode: INPUT_PULLUP
+        allow_other_uses: true
+      - number: GPIO5
+        mode: INPUT_PULLUP
+        allow_other_uses: true
+
+globals:
+  - id: ntp_synced
+    type: bool
+    initial_value: 'false'
+  - id: manifest_done
+    type: bool
+    initial_value: 'false'
+  - id: manifest_ok
+    type: bool
+    initial_value: 'false'
+  - id: dl_done
+    type: bool
+    initial_value: 'false'
+  - id: dl_ok
+    type: bool
+    initial_value: 'false'
+  - id: card_idx
+    type: int
+    initial_value: '0'
+  - id: sync_start_ms
+    type: uint32_t
+    initial_value: '0'
+  - id: wifi_ms
+    type: uint32_t
+    initial_value: '0'
+  - id: mqtt_ms
+    type: uint32_t
+    initial_value: '0'
+  - id: settings_ms
+    type: uint32_t
+    initial_value: '0'
+
+# The tick: while awake, starts a pass when one is due and puts the device to
+# sleep once nothing holds it awake. Every pass also calls the sleep gate
+# itself when it finishes, so a normal wake never waits for a tick.
+interval:
+  - interval: 1s
+    then:
+      # With deep sleep off (bench / USB power) the radio stays up.
+      - if:
+          condition:
+            lambda: 'return !wake::boot.radio_on && !wake::settings.deep_sleep;'
+          then:
+            - lambda: 'wake::boot.radio_on = true;'
+            - wifi.enable:
+      - if:
+          condition:
+            and:
+              - lambda: 'return wake::boot.pass_started;'
+              - not:
+                  script.is_running: wake_cycle
+          then:
+            - if:
+                condition:
+                  lambda: 'return wake::pass_wanted();'
+                then:
+                  - script.execute: wake_cycle
+                else:
+                  - lambda: |-
+                      wake::try_sleep(id(deep_sleep_1),
+                                      id(key_green).state || id(key_next).state || id(key_prev).state);
+
+script:
+  # One pass: service mode if requested, otherwise the carousel. Carousel
+  # order: draw (radio off, light-sleep refresh), then sync if due, then
+  # redraw if the sync replaced the card on the panel. With no valid time or
+  # an empty cache the sync comes first.
+  - id: wake_cycle
+    mode: single
+    then:
+      - lambda: 'wake::pass_begin();'
+      - if:
+          condition:
+            lambda: 'return wake::boot.service_requested;'
+          then:
+            - script.execute: service_mode
+            - script.wait: service_mode
+          else:
+            - if:
+                condition:
+                  lambda: 'return wake::boot.sync_first;'
+                then:
+                  - script.execute: sync_cards
+                  - script.wait: sync_cards
+                  - lambda: 'wake::draw_carousel(id(epaper_display), false);'
+                else:
+                  - lambda: 'wake::draw_carousel(id(epaper_display), false);'
+                  - if:
+                      condition:
+                        lambda: 'return wake::pass_needs_sync();'
+                      then:
+                        - script.execute: sync_cards
+                        - script.wait: sync_cards
+                        - lambda: 'wake::redraw_rewritten(id(epaper_display));'
+      - lambda: |-
+          wake::pass_end();
+          wake::try_sleep(id(deep_sleep_1),
+                          id(key_green).state || id(key_next).state || id(key_prev).state);
+
+  # Service mode: status screen up, sync, then keep the screen current (the
+  # countdown bar moves every 5 s) until the countdown ends or a white button
+  # is pressed; then back to the carousel.
+  - id: service_mode
+    mode: single
+    then:
+      - lambda: |-
+          wake::service_begin();
+          wake::boot.radio_on = true;
+      - wifi.enable:
+      - lambda: |-
+          wake::boot.service_syncing = true;
+          wake::service_update(id(epaper_display));
+      - script.execute: sync_cards
+      - script.wait: sync_cards
+      - lambda: |-
+          wake::boot.service_syncing = false;
+          wake::boot.service_dirty = true;
+      - while:
+          condition:
+            lambda: 'return !wake::service_done();'
+          then:
+            - lambda: 'wake::service_update(id(epaper_display));'
+            - delay: 200ms
+      # Radio off first, so the refresh back to the carousel can light-sleep.
+      - if:
+          condition:
+            lambda: 'return wake::settings.deep_sleep;'
+          then:
+            - mqtt.disable:
+            - wifi.disable:
+            - lambda: 'wake::boot.radio_on = false;'
+      - lambda: 'wake::service_end(id(epaper_display));'
+
+  # Wi-Fi up, measurements, clock, manifest, changed cards into the flash
+  # cache; Wi-Fi down again unless service mode or awake mode needs it.
+  - id: sync_cards
+    mode: single
+    then:
+      - lambda: |-
+          id(sync_start_ms) = millis();
+          wake::boot.radio_on = true;
+          id(ntp_synced) = false;
+          wake::boot.settings_received = 0;
+      # Battery before Wi-Fi: association draws current peaks that sag the
+      # cell by up to 60 mV (v0.3.0 readings). The SHT40 measures while the
+      # divider settles.
+      - output.turn_on: bsp_battery_enable
+      - component.update: sht
+      - delay: 100ms
+      - component.update: battery_voltage
+      - component.update: battery_level
+      - output.turn_off: bsp_battery_enable
+      - wifi.enable:
+      - wait_until:
+          condition:
+            wifi.connected:
+          timeout: 10s
+      - lambda: 'id(wifi_ms) = millis() - id(sync_start_ms);'
+      - if:
+          condition:
+            not:
+              wifi.connected:
+          then:
+            - lambda: 'wake::state.last_sync_result = wake::SYNC_NO_WIFI;'
+          else:
+            # Settings: the broker hands over each control's retained command
+            # right after the device subscribes. A setting HA has never
+            # changed has no retained command; the wait then times out and the
+            # current value stays.
+            - mqtt.enable:
+            - wait_until:
+                condition:
+                  mqtt.connected:
+                timeout: 5s
+            - lambda: 'id(mqtt_ms) = millis() - id(sync_start_ms);'
+            - wait_until:
+                condition:
+                  lambda: 'return wake::boot.settings_received >= 6;'
+                timeout: 1s
+            - lambda: 'id(settings_ms) = millis() - id(sync_start_ms);'
+            - if:
+                condition:
+                  lambda: |-
+                    return !wake::time_valid() ||
+                           wake::now() - wake::state.last_ntp >= wake::settings.ntp_every_s;
+                then:
+                  - wait_until:
+                      condition:
+                        lambda: 'return id(ntp_synced);'
+                      timeout: 5s
+            - lambda: |-
+                dns_cache::ensure("${manifest_host}");
+                id(manifest_done) = false;
+                id(manifest_ok) = false;
+            - http_request.get:
+                url: ${manifest_url}
+                capture_response: true
+                max_response_buffer_size: 4096
+                on_response:
+                  then:
+                    - lambda: |-
+                        id(manifest_ok) = response->status_code == 200 && wake::parse_manifest(body);
+                        id(manifest_done) = true;
+                on_error:
+                  then:
+                    - lambda: |-
+                        dns_cache::invalidate();
+                        id(manifest_done) = true;
+            - wait_until:
+                condition:
+                  lambda: 'return id(manifest_done);'
+                timeout: 20s
+            - if:
+                condition:
+                  lambda: 'return !id(manifest_ok);'
+                then:
+                  - lambda: 'wake::state.last_sync_result = wake::SYNC_MANIFEST_FAILED;'
+                else:
+                  - lambda: |-
+                      id(card_idx) = 0;
+                      wake::state.last_sync_result = wake::SYNC_OK;
+                  - while:
+                      condition:
+                        lambda: 'return id(card_idx) < (int) wake::urls.size();'
+                      then:
+                        - if:
+                            condition:
+                              lambda: 'return wake::card_needs_download(id(card_idx));'
+                            then:
+                              - lambda: |-
+                                  id(dl_done) = false;
+                                  id(dl_ok) = false;
+                              - online_image.set_url:
+                                  id: card_image
+                                  url: !lambda 'return wake::urls[id(card_idx)];'
+                              - wait_until:
+                                  condition:
+                                    lambda: 'return id(dl_done);'
+                                  timeout: 30s
+                              - lambda: |-
+                                  bool ok = id(dl_ok);
+                                  if (ok) {
+                                    auto *d = id(epaper_display);
+                                    wake::render.mode = wake::Mode::CARD_IMAGE;
+                                    d->render_only();
+                                    ok = wake::store_card(d, id(card_idx));
+                                  }
+                                  if (!ok)
+                                    wake::state.last_sync_result = wake::SYNC_CARD_FAILED;
+                        - lambda: 'id(card_idx) += 1;'
+                  - lambda: 'wake::finish_manifest();'
+      - lambda: |-
+          auto &s = wake::state;
+          s.last_sync_attempt = wake::now();
+          if (s.last_sync_result == wake::SYNC_OK)
+            s.last_sync_ok = s.last_sync_attempt;
+          if (!std::isnan(id(battery_voltage).state)) {
+            s.battery_v = id(battery_voltage).state;
+            s.battery_pct = (int8_t) id(battery_level).state;
+          }
+          if (!std::isnan(id(temp_sensor).state)) {
+            s.temp_c = id(temp_sensor).state;
+            s.humidity = id(hum_sensor).state;
+          }
+          if (id(wifi_id).is_connected())
+            s.rssi = (int8_t) id(wifi_id).wifi_rssi();
+          s.last_sync_ms = millis() - id(sync_start_ms);
+          wake::boot.sync_requested = false;
+          // Readings to Home Assistant (battery, temperature and humidity were
+          // already published when MQTT connected).
+          static const char *const RESULT[] = {"never", "ok", "no Wi-Fi", "manifest failed", "card failed"};
+          if (id(mqtt_client).is_connected()) {
+            id(wifi_rssi).publish_state(s.rssi);
+            id(sync_duration).publish_state(s.last_sync_ms);
+            id(wake_active).publish_state(s.last_active_ms);
+            id(card_count).publish_state(s.n_cards);
+            id(wake_count).publish_state(s.wakes);
+            id(sync_result).publish_state(RESULT[s.last_sync_result < 5 ? s.last_sync_result : 0]);
+            id(last_sync_time).publish_state(
+                ESPTime::from_epoch_utc(s.last_sync_attempt).strftime("%Y-%m-%dT%H:%M:%S+00:00"));
+            id(firmware).publish_state("${firmware_version}");
+          }
+          ESP_LOGI("wake", "sync: result=%u cards=%d battery=%.2fV (%d%%) in %u ms "
+                   "(wifi %u, mqtt %u, settings %u, %d received); internal heap min free %u",
+                   s.last_sync_result, (int) s.n_cards, s.battery_v, s.battery_pct, (unsigned) s.last_sync_ms,
+                   (unsigned) id(wifi_ms), (unsigned) id(mqtt_ms), (unsigned) id(settings_ms),
+                   wake::boot.settings_received,
+                   (unsigned) heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
+      - if:
+          condition:
+            lambda: 'return !wake::keep_radio();'
+          then:
+            - mqtt.disable:
+            - wifi.disable:
+            - lambda: 'wake::boot.radio_on = false;'
+
+display:
+  - platform: waveshare_epaper
+    id: epaper_display
+    model: gdey075t7  # vendored + patched; see NOTES.md "Hardware quirks"
+    cs_pin: GPIO10
+    dc_pin: GPIO11
+    reset_pin:
+      number: GPIO12
+      inverted: false
+    busy_pin:
+      number: GPIO13
+      inverted: false  # the driver already inverts BUSY; see NOTES.md
+    data_rate: 10MHz
+    update_interval: never
+    # Only renders into the framebuffer (cards during a sync, the service
+    # screen, messages); wake.h drives the actual refreshes. Explicit
+    # Color::BLACK everywhere: the default COLOR_ON is the same raw value as
+    # WHITE, the background.
+    lambda: |-
+      it.fill(Color::WHITE);
+      const auto &r = wake::render;
+      if (r.mode == wake::Mode::CARD_IMAGE) {
+        it.image(0, 0, id(card_image));
+        return;
+      }
+      if (r.mode == wake::Mode::MESSAGE) {
+        it.printf(400, 240, id(font_pixel_lg), Color::BLACK, TextAlign::CENTER, "%s", r.message);
+        return;
+      }
+      // Service screen: live values.
+      const auto &s = wake::state;
+      auto when = [](uint32_t t) -> std::string {
+        return t == 0 ? std::string("never") : ESPTime::from_epoch_local(t).strftime("%Y-%m-%d %H:%M");
+      };
+      static const char *const SYNC[] = {"never", "ok", "no Wi-Fi", "manifest failed", "card failed"};
+      const int c1 = 24, c2 = 420, row = 32;
+      int y = 20;
+      it.printf(c1, y, id(font_pixel_lg), Color::BLACK, "Service mode");
+      it.printf(776, y, id(font_pixel_lg), Color::BLACK, TextAlign::TOP_RIGHT, "v${firmware_version}");
+      y += 42;
+      it.line(c1, y, 776, y, Color::BLACK);
+      y += 14;
+      if (wake::boot.service_syncing)
+        it.printf(c1, y, id(font_pixel), Color::BLACK, "Syncing...");
+      else
+        it.printf(c1, y, id(font_pixel), Color::BLACK, "Sync %s at %s (%u ms)",
+                  SYNC[s.last_sync_result < 5 ? s.last_sync_result : 0], when(s.last_sync_attempt).c_str(),
+                  (unsigned) s.last_sync_ms);
+      y += row + 8;
+      int y1 = y, y2 = y;
+      it.printf(c1, y1, id(font_pixel), Color::BLACK, "Time: %s", when(wake::now()).c_str());
+      y1 += row;
+      it.printf(c1, y1, id(font_pixel), Color::BLACK, "Clock set: %s", when(s.last_ntp).c_str());
+      y1 += row;
+      if (s.battery_pct >= 0)
+        it.printf(c1, y1, id(font_pixel), Color::BLACK, "Battery: %.2fV (%d%%)", s.battery_v, (int) s.battery_pct);
+      else
+        it.printf(c1, y1, id(font_pixel), Color::BLACK, "Battery: not measured yet");
+      y1 += row;
+      it.printf(c1, y1, id(font_pixel), Color::BLACK, "Temp: %.1f C  Humidity: %.1f %%", s.temp_c, s.humidity);
+      y1 += row;
+      char ip[network::IP_ADDRESS_BUFFER_SIZE];
+      id(wifi_id).get_ip_addresses()[0].str_to(ip);
+      it.printf(c1, y1, id(font_pixel), Color::BLACK, "IP: %s  RSSI: %d dBm", ip, (int) s.rssi);
+      y1 += row;
+      it.printf(c1, y1, id(font_pixel), Color::BLACK, "Wakes: %u  Last active: %u ms", (unsigned) s.wakes,
+                (unsigned) s.last_active_ms);
+      it.printf(c2, y2, id(font_pixel), Color::BLACK, "Cards: %d", (int) s.n_cards);
+      y2 += row;
+      it.printf(c2, y2, id(font_pixel), Color::BLACK, "Cards generated: %s", when(s.cards_generated_at).c_str());
+      y2 += row;
+      it.printf(c2, y2, id(font_pixel), Color::BLACK, "Last good sync: %s", when(s.last_sync_ok).c_str());
+      y2 += row;
+      it.printf(c2, y2, id(font_pixel), Color::BLACK, "Rotate %u s, sync every %u min +%u",
+                (unsigned) wake::settings.rotate_s, (unsigned) (wake::settings.sync_period_s / 60),
+                (unsigned) (wake::settings.sync_offset_s / 60));
+      y2 += row;
+      it.printf(c2, y2, id(font_pixel), Color::BLACK, "Full refresh every %u updates",
+                (unsigned) wake::settings.full_refresh_every);
+      // Countdown bar.
+      const uint32_t total = wake::settings.service_s * 1000;
+      const uint32_t left = wake::service_remaining_ms();
+      it.printf(c1, 392, id(font_pixel), Color::BLACK, "Back to the cards in %u s", (unsigned) ((left + 999) / 1000));
+      it.printf(776, 392, id(font_pixel), Color::BLACK, TextAlign::TOP_RIGHT, "Green: more time   White: back now");
+      it.rectangle(c1, 420, 752, 28, Color::BLACK);
+      const int fill = total > 0 ? (int) ((uint64_t) 748 * left / total) : 0;
+      if (fill > 0)
+        it.filled_rectangle(c1 + 2, 422, fill, 24, Color::BLACK);

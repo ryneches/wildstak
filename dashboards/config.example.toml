@@ -1,0 +1,62 @@
+# Dashboard config. Copy to config.toml (gitignored) and edit. See
+# DASHBOARD_SPEC.md for the full contract this file participates in (which
+# fields are global vs. per-card, and how each maps to a CLI override).
+
+[global]
+ha_url = "http://homeassistant.local:8123"
+# Home Assistant long-lived access token (your HA profile, Security tab), as
+# a plain text file holding just the token. Relative to this file; the
+# Makefile passes --key-file .env (repo root) instead.
+key_file = "../.env"
+
+# IANA timezone for day boundaries and time axes; match the firmware's
+# timezone substitution in firmware/device.yaml.
+timezone = "America/Los_Angeles"
+
+canvas_width = 800
+canvas_height = 480
+dpi = 72
+
+# Fraction of a device row's height actually used by its bar/plot; the rest
+# is gap between rows. Row height itself is always n_devices/_BODY_H derived
+# automatically - this only tunes the fill/spacing within that row, and is
+# the one layout knob meant to be hand-tuned per card (see DASHBOARD_SPEC.md).
+row_fill = 0.53
+
+[global.label_font]
+# Body font: device labels, tick labels, values. Native 16px-tall pixel grid
+# - non-native sizes mix 1px/2px strokes unevenly (see DASHBOARD_SPEC.md).
+path = "fonts/x12y16pxMaruMonica.ttf"
+size_dev = 16
+size_small = 12
+
+[global.title_font]
+# Section titles only. A different, larger pixel-style font: MaruMonica
+# looked uneven at any size other than its native 16px, so titles use a
+# font that stays crisp at a bigger size instead of scaling the body font.
+path = "fonts/EnkaDotGothic24.ttf"
+size = 24
+
+# One [[entities]] table per device, shared by both cards; rows are sized
+# automatically. energy: a cumulative kWh sensor (state_class
+# total_increasing). power: its live W sensor (optional; without it the
+# device's row on the daily card has no plot). label: keep it short, the
+# label column is 80 px ("Bedroom HP" fits). tools/ha_sensors.py lists your
+# sensors and prints suggested tables to paste here.
+[[entities]]
+energy = "sensor.refrigerator_energy"
+power  = "sensor.refrigerator_power"
+label  = "Fridge"
+
+[[entities]]
+energy = "sensor.washing_machine_energy"
+power  = "sensor.washing_machine_power"
+label  = "Washer"
+
+[cards.weekly_energy]
+title_left  = "Daily Usage"
+title_right = "Weekly Usage"
+
+[cards.daily_energy]
+title_left  = "Daily Usage"
+title_right = "Last 24h kWh"

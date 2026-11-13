@@ -1,0 +1,14 @@
+# Python packages for the dashboard cards (dashboards/) and tools/.
+# Pinned to the versions tested together, on Python 3.12 (3.11 is the
+# minimum: config loading uses tomllib).
+#
+#   python3 -m venv .venv
+#   .venv/bin/pip install -r requirements.txt
+#   make            # uses .venv/bin/python when it exists
+#
+# Zensical, for the optional `make site`, is installed separately.
+Pillow==12.3.0
+matplotlib==3.10.6
+numpy==2.4.3
+polars==1.25.2
+requests==2.34.2

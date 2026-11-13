@@ -1,0 +1,43 @@
+# Your device. Copy to device.yaml (gitignored), edit, and build with:
+#
+#   esphome run device.yaml
+#
+# wildstak.yaml is the shared base; anything set here overrides it, so
+# updating the repo never conflicts with your settings. Secrets go in
+# secrets.yaml (copy secrets.example.yaml).
+
+packages:
+  wildstak: !include wildstak.yaml
+
+substitutions:
+  name: wildstak                # hostname and MQTT topic prefix
+  friendly_name: WildStak       # device name in Home Assistant
+
+  # Where `make` publishes the cards: BASE_URL in the Makefile, plus
+  # /data/dashboards.txt. manifest_host is that URL's hostname.
+  manifest_host: "dashboards.example.com"
+  manifest_url: "https://dashboards.example.com/data/dashboards.txt"
+
+  # Home Assistant's MQTT broker (e.g. the Mosquitto add-on) and the user
+  # you created for the device there.
+  mqtt_broker: "homeassistant.local"
+  mqtt_port: "1883"
+  mqtt_username: "wildstak"
+
+  timezone: "America/Los_Angeles"   # IANA name; match dashboards/config.toml
+  ntp_server: "pool.ntp.org"
+
+# Optional: a static IP outside your router's DHCP range skips DHCP on every
+# sync (~1.7 s of radio time saved).
+# wifi:
+#   manual_ip:
+#     static_ip: 192.168.1.50
+#     gateway: 192.168.1.1
+#     subnet: 255.255.255.0
+#     dns1: 192.168.1.1
+
+# Optional: MQTT over TLS (usually port 8883), e.g. a broker behind a reverse
+# proxy with a Let's Encrypt certificate. ESPHome's MQTT client doesn't use
+# ESP-IDF's CA bundle, so the roots are pinned; see certs/README.md.
+# mqtt:
+#   certificate_authority: !include certs/letsencrypt_roots.yaml

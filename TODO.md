@@ -102,8 +102,9 @@ as it is. License: GPL-3.0. The vendored display driver is Apache-2.0
 
 ### Phase 6: Publish
 
-- [ ] Final grep for secrets, IPs, and personal names.
-- [ ] First commit, create the GitHub repo, push.
+- [x] Final scan for secrets, IPs, hostnames, and personal names: clean
+      (only placeholder IPs and the intended `ryneches` project ID / URL).
+- [x] First commit; public repo at github.com/ryneches/wildstak, pushed.
 
 ## Rendering pathway (low priority / research only)
 

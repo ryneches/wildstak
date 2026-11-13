@@ -206,7 +206,7 @@ component's README.md lists every change):
 
 There's no native API; the Home Assistant link is MQTT, through HA's MQTT
 integration and discovery, on whatever broker HA uses (e.g. the Mosquitto
-add-on). Plain MQTT by default; TLS is an override in `device.yaml` (see
+broker app). Plain MQTT by default; TLS is an override in `device.yaml` (see
 `firmware/certs/README.md`). The device logs in as its own MQTT user
 (`mqtt_username`, password in `secrets.yaml`); if the broker has ACLs, that
 user needs the device's `<name>/` topics and the `homeassistant/` discovery
@@ -627,8 +627,8 @@ Seeed's [ESPHome cookbook for the reTerminal E Series](https://wiki.seeedstudio.
 says to use ESPHome's built-in `waveshare_epaper` component with
 `model: 7.50inv2` (or `7.50inv2alt`). **All three built-in model variants
 we tried (`7.50inv2`, `7.50inv2alt`, `7.50inv2p`) produced corrupted
-output** — solid black, reproducible "snow" (deterministic per-pixel
-scrambling, not noise), or a busy-pin timeout — despite the pins matching
+output**: solid black, reproducible "snow" (deterministic per-pixel
+scrambling, not noise), or a busy-pin timeout, despite the pins matching
 Seeed's docs exactly.
 
 The actual panel is a **Good Display GDEY075T7** (UC8179 controller), not
@@ -670,7 +670,7 @@ isolation test: draw a black square at `(0,0)` with everything else
 white, and see where/what color it comes back as. Correct geometry +
 inverted color → pure polarity bug, not a driver/model mismatch. The fix
 removes the inversion entirely (both the software `~` in `write_frame_`
-and the hardware DDX polarity bit in `write_partial_`) — the panel wants
+and the hardware DDX polarity bit in `write_partial_`): the panel wants
 the framebuffer sent exactly as ESPHome's core produces it.
 
 If you ever swap in a different physical panel revision, this is the
@@ -683,7 +683,7 @@ position/color and see if position and color both come back correct.
 `GRAYSCALE`-typed `Image` via `it.image()` goes through
 [`image.cpp`](https://github.com/esphome/esphome/blob/dev/esphome/components/image/image.cpp)'s
 `IMAGE_TYPE_GRAYSCALE` case, which builds
-`Color(gray, gray, gray, 0xFF)` — the 4th ("white"/alpha) channel is
+`Color(gray, gray, gray, 0xFF)`: the 4th ("white"/alpha) channel is
 **hardcoded to `0xFF` regardless of `gray`**. `Color::is_on()` is just
 `raw_32 != 0`, so it's `true` for *every* pixel, light or dark. The
 monochrome driver's pixel-set logic branches purely on `is_on()`, so the
@@ -696,7 +696,7 @@ threshold (`is_color_on()`, `0.25R + 0.5G + 0.25B` approximation) into a
 genuine 1-bit-packed buffer, and the draw path uses explicit
 `color_on`/`color_off` rather than `is_on()`. This is also dramatically
 faster than the pixel-by-pixel `get_pixel()` + `draw_pixel_at()` lambda
-workaround we tried first — that's not needed at all with `BINARY`.
+workaround we tried first; that's not needed at all with `BINARY`.
 
 ### Cache images in PSRAM explicitly, or crash
 
@@ -711,7 +711,7 @@ the 8 MB of PSRAM `online_image` itself uses via the same allocator.
 With two ~48 KB cached images plus everything else already on the heap,
 internal DRAM ran out, `std::vector::assign()`'s internal `operator new`
 threw `bad_alloc`, and since this ESP-IDF/ESPHome build doesn't support
-real C++ exception unwinding, that became an immediate `abort()` — a
+real C++ exception unwinding, that became an immediate `abort()`: a
 clean crash-reboot loop, confirmed via a symbolized backtrace
 (`xtensa-esp32s3-elf-addr2line` against the build's `firmware.elf`)
 pointing at `__wrap___cxa_allocate_exception`.
@@ -733,7 +733,7 @@ inside `OnlineImage::loop()`, **before** that same `loop()` call reaches
 that `update()` checks (`if (this->decoder_) { "already being updated"; return; }`).
 If `on_download_finished` immediately calls `online_image.set_url` again
 (as sequential prefetch needs to, to move to the next manifest URL), it
-hits that guard and silently no-ops — the whole prefetch chain stalls
+hits that guard and silently no-ops: the whole prefetch chain stalls
 with no error, because nothing schedules another attempt. Fix: a short
 `delay: 50ms` before the next `set_url`, which yields control back to the
 scheduler long enough for the current `loop()` call to finish and reset
@@ -774,7 +774,7 @@ place "what's due right now" is decided. This replaced an earlier design
 (v0.1) built around a scattered mix of
 script-to-script continuations (`after_manifest_action`/
 `after_refresh_action` globals), a bare `is_busy` boolean, and an
-always-on `interval: 20s` poll — which together made it possible for two
+always-on `interval: 20s` poll, which together made it possible for two
 independent triggers (that poll, and `on_boot`'s own startup chain) to act
 on shared state at the same time. Concretely, that race let the
 `deep_sleep:` block's own automatic `run_duration` safety-net timer fire
@@ -787,55 +787,55 @@ blank IP/SSID, no cards).
 
 Every task follows the same shape: check its own preconditions first
 (most concretely, never proceed into a fetch with Wi-Fi still
-associating — `task_update_manifest`/`task_download_cards` each
+associating: `task_update_manifest`/`task_download_cards` each
 `wait_until wifi.connected` with a bounded timeout and bail cleanly if it
 never resolves), do its work, then hand off by setting a `pending_*`
-global and calling `task_dispatcher` — never by leaving a continuation for
+global and calling `task_dispatcher`, never by leaving a continuation for
 someone else to interpret later.
 
-- **`task_boot`** — hardware init only (battery GPIO, `pcf8563.read_time`,
+- **`task_boot`**: hardware init only (battery GPIO, `pcf8563.read_time`,
   `deep_sleep.prevent`), no content-related branching. It does not need
   to know fresh-boot vs. sleep-wake; it just hands off to
   `idle_scheduler`, the same as everything else that finds nothing else
   pending.
-- **`idle_scheduler`** — pure local computation, no network. Decides
+- **`idle_scheduler`**: pure local computation, no network. Decides
   manifest staleness by comparing the manifest's own parsed timestamp
   (`cards_generated_at_epoch`) against the Data Update Period/Offset grid
-  boundary and the current time — not a separately-tracked checkpoint, so
+  boundary and the current time, not a separately-tracked checkpoint, so
   there's nothing that can drift out of sync with reality. Also checks
   whether `image_cache` matches `dashboard_urls` (always false right
   after a real sleep, since PSRAM loses power) and whether Rotate
   Interval is due. If nothing's due, it computes how long until something
   will be and either enqueues `task_sleep` for that duration (if "Deep
   Sleep Enabled" and not "OTA Mode") or arms a one-shot delayed
-  re-check (`idle_wait`) — this replaces the old `interval: 20s` poll
+  re-check (`idle_wait`). This replaces the old `interval: 20s` poll
   entirely; there is no independent always-on trigger left to race
   anything. When the rotate-due check fires, it resets
   `elapsed_since_rotate` to `0` right there, before enqueueing the
-  rotate — this accumulator only ever counts up otherwise, so skipping
+  rotate: this accumulator only ever counts up otherwise, so skipping
   the reset here means the very next pass finds the threshold still
   exceeded and re-triggers immediately, forever (confirmed on real
   hardware: a tight rotate loop, one redraw every couple of seconds,
-  that also starves the sleep decision below it in priority — "Deep
+  that also starves the sleep decision below it in priority, so "Deep
   Sleep Enabled" never gets reached at all).
-- **`task_update_manifest`** / **`task_download_cards`** — same
+- **`task_update_manifest`** / **`task_download_cards`**: same
   HTTP-fetch/prefetch mechanics as before, just re-homed as task bodies.
   A fetch failure doesn't retry immediately (which would starve the sleep
-  branch during an outage) — `manifest_attempted_this_wake` caps retries
+  branch during an outage); `manifest_attempted_this_wake` caps retries
   to roughly once per Wake Interval heartbeat.
-- **`task_display_card`** — draws either the next real card or, once per
+- **`task_display_card`**: draws either the next real card or, once per
   lap through the real cards (`diagnostics_turn_next`), a freshly
   synthesized diagnostics screen. Diagnostics is no longer card `0` of an
-  `n+1`-slot rotation — `page_index` indexes only real fetched cards
+  `n+1`-slot rotation; `page_index` indexes only real fetched cards
   (`0..n-1`); diagnostics content is never cached or given an index at
   all, it's recomputed live every time its turn comes up, at the same
   cadence a viewer would have seen it before.
-- **`task_sleep`** — the *only* place that ever calls `deep_sleep.allow`,
+- **`task_sleep`**: the *only* place that ever calls `deep_sleep.allow`,
   called immediately before its own `deep_sleep.enter`. See "Deep sleep
   invariant" below. Before that, it waits out the "Sleep Delay" number
   entity (default 15s, on top of the fixed 2s SPI-safety delay) with
   Wi-Fi/API/OTA still fully up, then re-checks "Deep Sleep Enabled"/"OTA
-  Mode" — if either changed during that window, it aborts and hands back
+  Mode"; if either changed during that window, it aborts and hands back
   to `task_dispatcher` instead of committing to sleep. With "Deep Sleep
   Enabled" on, a wake where nothing else is due otherwise only stays
   reachable for well under a second, which isn't enough time to reliably
@@ -843,17 +843,17 @@ someone else to interpret later.
 
 ### Controls
 
-- Physical buttons: GPIO3 ("Next"), GPIO5 ("Prev") — both just call
+- Physical buttons: GPIO3 ("Next"), GPIO5 ("Prev"); both just call
   `enqueue_display_card` directly, no busy-flag check anywhere. GPIO4 is
   `deep_sleep`'s `wakeup_pin` and can't *also* be a bound `binary_sensor`;
-  a press on it just looks like any other timer wake to `task_boot` — there's
+  a press on it just looks like any other timer wake to `task_boot`; there's
   no special button-wake handling any more (this fell out naturally once
   `idle_scheduler` stopped needing to know *why* it's running).
 - Home Assistant: "Next Card" and "Reload Manifest" buttons, "Diagnostics
   Card"/"Deep Sleep Enabled"/"OTA Mode" switches, and the interval/period/
-  "Sleep Delay" entities — all exposed automatically via ESPHome's native
+  "Sleep Delay" entities, all exposed automatically via ESPHome's native
   API.
-- `firmware_version` (substitutions block, top of the firmware YAML) —
+- `firmware_version` (substitutions block, top of the firmware YAML):
   bump by hand on any meaningful change. Shown on the diagnostics screen
   ("Firmware: vX.Y.Z") and as the ESPHome project version (visible in HA's
   device info page), both from the same substitution.
@@ -861,12 +861,12 @@ someone else to interpret later.
   trigger enqueues through `enqueue_update_manifest`/
   `enqueue_download_cards`/`enqueue_display_card`; `task_dispatcher` is
   the only thing that decides whether to run something now (nothing else
-  active) or leave it pending (something's already running — the request
+  active) or leave it pending (something's already running; the request
   isn't dropped, it's serviced once the current task finishes).
   Repeated same-type requests coalesce (rapid "Next" presses sum into
   `pending_display_steps` and render once caught up) rather than firing a
   rapid-fire catch-up burst once the device frees up, which is what an
-  earlier, more naive version of the busy-guard did — this only actually
+  earlier, more naive version of the busy-guard did. This only actually
   holds because every `enqueue_*` script is `mode: queued`; see "Every
   hand-back script needs `mode: queued`" below.
 
@@ -875,32 +875,32 @@ someone else to interpret later.
 `deep_sleep.prevent` is called unconditionally as the first action of
 every boot, regardless of the "Deep Sleep Enabled" switch. Nothing else
 in the file ever calls `deep_sleep.allow` except `task_sleep`, directly
-before its own `deep_sleep.enter` — so the `run_duration` (90s)
+before its own `deep_sleep.enter`, so the `run_duration` (90s)
 safety-net timer is structurally incapable of firing mid-task; it's only
 ever armed for the brief window inside the one task built to enter sleep.
 "Deep Sleep Enabled" and "OTA Mode" are both plain config booleans now,
-read only by `idle_scheduler` — neither switch touches
+read only by `idle_scheduler`; neither switch touches
 `deep_sleep.allow`/`prevent` directly any more (that direct-call pattern
 is what let the safety net re-arm at an uncoordinated moment in the first
 place).
 
 The `gooddisplay_gdey075t7.cpp` `display()` method logs
-`display() #N/30: FULL/partial refresh` — useful for confirming whether a
+`display() #N/30: FULL/partial refresh`: useful for confirming whether a
 slow, flashy redraw was the periodic de-ghosting full-refresh (every 30th
 update by default in v0.2) rather than a bug.
 
 ### Every hand-back script needs `mode: queued`
 
 `script.execute` keeps the *calling* script marked "running" for as long
-as the callee — transitively, including whatever the callee itself calls,
-and any delay inside that chain — is still active, not just until the
+as the callee (transitively, including whatever the callee itself calls,
+and any delay inside that chain) is still active, not just until the
 callee's first yield. So any script that can be reached both as a nested
 hand-back (e.g. `idle_scheduler` calling back into itself via
 `idle_wait`) *and* as a fresh top-level call arriving while that nested
 chain is still going (a button press) is exposed to ESPHome's default
 `mode: single` behavior: the second call is silently **dropped**, not
 queued, logged only as `Script 'X' is already running!`. For
-`enqueue_display_card` specifically this isn't just a log line — the
+`enqueue_display_card` specifically this isn't just a log line: the
 dropped call's `pending_display_steps += steps` lambda never runs, so a
 real button press vanishes with no effect at all.
 
@@ -908,7 +908,7 @@ real button press vanishes with no effect at all.
 semantics), and every script sitting on this hand-back graph needs it:
 `task_dispatcher`, `enqueue_update_manifest`, `enqueue_download_cards`,
 `enqueue_display_card`, `idle_scheduler`, `idle_wait`, `task_sleep`. A
-delay-based yield does **not** fix this — tried first, it just relocates
+delay-based yield does **not** fix this: tried first, it just relocates
 the same rejection onto whatever script the delay lives in, confirmed the
 hard way on real hardware.
 
@@ -917,12 +917,12 @@ backlog of queued instances (this happened once, caused by the
 `elapsed_since_rotate` bug above generating dozens of queued dispatcher
 passes in a couple of minutes), draining that backlog can briefly let
 more than one instance reach "nothing pending, sleep" nearly
-simultaneously right as the last queued render is still in flight —
+simultaneously right as the last queued render is still in flight:
 observed once as a `Timeout while displaying image!` error moments after
 `Beginning sleep` was logged, i.e. a render racing actual hardware
 power-down. `task_sleep`'s `mode: queued` prevents *multiple*
 `deep_sleep.enter` calls from that scenario, but the real fix is not
-generating the backlog in the first place — this is a symptom to watch
+generating the backlog in the first place; this is a symptom to watch
 for, not a separate bug to chase if the queue stays small under normal
 operation.
 

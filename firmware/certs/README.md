@@ -6,7 +6,7 @@ broker with a Let's Encrypt certificate, e.g. behind a reverse proxy
 `device.example.yaml`). ESPHome's MQTT client doesn't use ESP-IDF's
 certificate bundle, so the roots are pinned here. It's a YAML document
 holding one string, so ESPHome can `!include` it. Plain MQTT on your LAN
-(the Home Assistant Mosquitto add-on's default) doesn't need any of this.
+(the default with Home Assistant's Mosquitto broker app) doesn't need any of this.
 
 | Root | Key | Valid until | SHA-256 fingerprint |
 |---|---|---|---|

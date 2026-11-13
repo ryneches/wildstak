@@ -43,7 +43,7 @@ substitutions:
   # the manifest URL's hostname, for the DNS cache.
   manifest_host: "dashboards.example.com"
   manifest_url: "https://dashboards.example.com/data/dashboards.txt"
-  # The MQTT broker Home Assistant uses (e.g. the Mosquitto add-on). Plain
+  # The MQTT broker Home Assistant uses (e.g. the Mosquitto broker app). Plain
   # MQTT by default; for TLS, see device.example.yaml.
   mqtt_broker: "homeassistant.local"
   mqtt_port: "1883"

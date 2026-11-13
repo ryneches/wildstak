@@ -96,9 +96,13 @@ as it is. License: GPL-3.0. The vendored display driver is Apache-2.0
       (exported-energy sensors listed as devices; a device holding two plugs
       left unpaired). It now reproduces the hand-written config.
 - [x] Driver README: added the color polarity change (also a local patch).
-- [ ] Decide: replace the em dashes in NOTES.md / DASHBOARD_SPEC.md (70,
-      from the original text)?
-- [ ] Decide: sample card PNGs in the README (would show real usage data)?
+- [x] Em dashes: all 68 in NOTES.md and DASHBOARD_SPEC.md replaced
+      (colon, semicolon, comma, or a new sentence, per context); none left
+      anywhere in the repo, docstrings included.
+- [x] Real weekly and daily cards in the README (`assets/`), rendered from
+      a live HA on 2026-11-14.
+- [x] README links Home Assistant's MQTT integration docs and the Mosquitto
+      broker app docs (add-ons are now "apps"; mentions updated repo-wide).
 
 ### Phase 6: Publish
 

@@ -18,7 +18,7 @@ substitutions:
   manifest_host: "dashboards.example.com"
   manifest_url: "https://dashboards.example.com/data/dashboards.txt"
 
-  # Home Assistant's MQTT broker (e.g. the Mosquitto add-on) and the user
+  # Home Assistant's MQTT broker (e.g. the Mosquitto broker app) and the user
   # you created for the device there.
   mqtt_broker: "homeassistant.local"
   mqtt_port: "1883"
